@@ -1,0 +1,5 @@
+GET /en/transaction/search?fl=1 HTTP/1.1
+Host: data.nbd.ltd
+Cookie: auth=<your-auth-token>; JSESSIONID=<your-session-id>
+Referer: https://en.nbd.ltd/
+User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36
