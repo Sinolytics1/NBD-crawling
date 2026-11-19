@@ -20,17 +20,25 @@ The cookie expires after a while. If the script lands on a login page, copy a fr
 **3. Run**
 
 ```bash
-python playwright_scrape_exporter.py --country CHINA --start-date 2025-12-31
+python playwright_scrape_exporter.py --country CHINA --hs-code 48119000 \
+  --company "HENAN JIANGHE PAPER CO., LTD." \
+  --search-start 2025-11-19 --search-end 2026-11-19
 ```
 
-- `--country`: `CHINA` or `VIETNAM`
-- `--start-date`: the script pages backwards from the newest records and starts saving once Date ≤ this date
+- `--country`: `CHINA` or `VIETNAM` (the country button clicked after Query)
+- `--hs-code`: HS code in the search form
+- `--company`: Company Name in the search form; leave out to search all companies
+- `--search-start` / `--search-end`: Start Date / End Date in the search form (YYYY-MM-DD)
+- `--start-date` (optional): the script pages backwards from the newest records and starts saving once Date ≤ this date. Defaults to `--search-end`, so everything in the search range is saved.
+- `--out` (optional): output CSV name. Relative paths are placed next to the script.
 
-The HS code and date range are set as constants at the top of the script (`SEARCH_HS_CODE`, `SEARCH_START_DATE`, `SEARCH_DATE_CLOSED`).
+Defaults for the search fields are the constants at the top of the script (`SEARCH_HS_CODE`, `SEARCH_COMPANY_NAME`, `SEARCH_START_DATE`, `SEARCH_DATE_CLOSED`).
 
 ## Output
 
-`<country>_exporter_transaction.csv` with one row per transaction:
+Without `--out`, the CSV name is built from the search: `<country>_<hs code>_<company>_<start>-<end>.csv`, e.g. `china_48119000_HENAN_JIANGHE_PAPER_CO_LTD_20251119-20261119.csv`. The same search always writes to the same file, so a rerun resumes it, and a different search never mixes into it. A `_meta.json` file is written next to it.
+
+One row per transaction:
 
 Date, Export country or region, Import country or region, HS Code, Product Description, Exporter, Quantity, View (link to the detail page).
 
@@ -41,7 +49,7 @@ If the run stops, run the same command again to resume. Rows already saved are s
 The list only shows a truncated description and no value. To open each record's detail page and add **Description Of Goods, USD Amount(FOB), Price in USD(FOB), Weight**, run the script again on the existing CSV:
 
 ```bash
-python playwright_scrape_exporter.py --country CHINA --detail TRUE
+python playwright_scrape_exporter.py --country CHINA --detail TRUE   # plus the same search arguments as step 3
 ```
 
 - Runs only when the CSV from step 3 already exists. It fills rows in `DETAIL_RANGE_START`–`DETAIL_RANGE_END`, newest first.

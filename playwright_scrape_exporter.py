@@ -47,8 +47,10 @@ DETAIL_EXTRA_COLUMNS = [
 # and enrich_csv_details_date_range() when CSV exists (main()).
 FETCH_DETAIL_PAGES = False
 
-# Search form (transaction search page).
+# Search form (transaction search page). Defaults; override with --hs-code / --company /
+# --search-start / --search-end.
 SEARCH_HS_CODE = "850710"
+SEARCH_COMPANY_NAME = ""  # empty = do not filter by company
 SEARCH_START_DATE = "2025-01-01"
 SEARCH_DATE_CLOSED = "2025-12-31"
 ROWS_PER_PAGE_ASSUMED = 10  # used with existing row count to skip pages when resuming
@@ -95,9 +97,41 @@ def parse_cli_args() -> argparse.Namespace:
         help="Country button to click (CHINA or VIETNAM).",
     )
     parser.add_argument(
-        "--start-date",
+        "--hs-code",
+        default=SEARCH_HS_CODE,
+        help=f"HS code to search (default: {SEARCH_HS_CODE}).",
+    )
+    parser.add_argument(
+        "--company",
+        default=SEARCH_COMPANY_NAME,
+        help='Company Name filter, e.g. "HENAN JIANGHE PAPER CO., LTD." (default: no filter).',
+    )
+    parser.add_argument(
+        "--search-start",
+        default=SEARCH_START_DATE,
+        help=f"Search form Start Date, YYYY-MM-DD (default: {SEARCH_START_DATE}).",
+    )
+    parser.add_argument(
+        "--search-end",
         default=SEARCH_DATE_CLOSED,
-        help="Start collecting non-detail rows when Date <= this value (YYYY-MM-DD).",
+        help=f"Search form End Date, YYYY-MM-DD (default: {SEARCH_DATE_CLOSED}).",
+    )
+    parser.add_argument(
+        "--start-date",
+        default=None,
+        help=(
+            "Start collecting non-detail rows when Date <= this value (YYYY-MM-DD). "
+            "Default: same as --search-end, i.e. collect everything in the search range."
+        ),
+    )
+    parser.add_argument(
+        "--out",
+        default=None,
+        help=(
+            "Output CSV file name or path (relative paths are next to this script). "
+            "Default: built from country, HS code, company and search dates, e.g. "
+            "china_48119000_HENAN_JIANGHE_PAPER_CO_LTD_20251119-20261119.csv"
+        ),
     )
     parser.add_argument(
         "--detail",
@@ -108,20 +142,67 @@ def parse_cli_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _parse_iso_date_arg(value: str, name: str) -> date:
+    try:
+        return datetime.strptime(value.strip(), "%Y-%m-%d").date()
+    except ValueError:
+        raise SystemExit(f"{name} must be YYYY-MM-DD, got {value!r}")
+
+
+def _company_slug(company: str, max_len: int = 40) -> str:
+    out = []
+    for ch in company.upper():
+        out.append(ch if ch.isascii() and ch.isalnum() else "_")
+    slug = "_".join(part for part in "".join(out).split("_") if part)
+    return slug[:max_len].rstrip("_")
+
+
+def build_default_output_csv(country: str, hs_code: str, company: str, start: date, end: date) -> Path:
+    parts = [country.strip().lower(), hs_code.strip() or "allhs"]
+    slug = _company_slug(company)
+    if slug:
+        parts.append(slug)
+    parts.append(f"{start:%Y%m%d}-{end:%Y%m%d}")
+    return Path(__file__).with_name("_".join(parts) + ".csv")
+
+
 def apply_runtime_config(args: argparse.Namespace) -> None:
-    global TARGET_COUNTRY
+    global TARGET_COUNTRY, SEARCH_HS_CODE, SEARCH_COMPANY_NAME, SEARCH_START_DATE, SEARCH_DATE_CLOSED
     global OUT_CSV, OUT_META, OUT_SCREENSHOT, OUT_DEBUG_HTML, OUT_DEBUG_SCREENSHOT
     global NON_DETAIL_START_FROM_DATE, FETCH_DETAIL_PAGES
 
     TARGET_COUNTRY = args.country
-    slug = TARGET_COUNTRY.strip().lower()
-    OUT_CSV = Path(__file__).with_name(f"{slug}_exporter_transaction.csv")
-    OUT_META = Path(__file__).with_name(f"{slug}_exporter_transaction_meta.json")
-    OUT_SCREENSHOT = Path(__file__).with_name(f"{slug}_exporter_transaction.png")
-    OUT_DEBUG_HTML = Path(__file__).with_name(f"{slug}_exporter_transaction_debug.html")
-    OUT_DEBUG_SCREENSHOT = Path(__file__).with_name(f"{slug}_exporter_transaction_debug.png")
+    SEARCH_HS_CODE = (args.hs_code or "").strip()
+    SEARCH_COMPANY_NAME = (args.company or "").strip()
 
-    NON_DETAIL_START_FROM_DATE = datetime.strptime(args.start_date, "%Y-%m-%d").date()
+    search_start = _parse_iso_date_arg(args.search_start, "--search-start")
+    search_end = _parse_iso_date_arg(args.search_end, "--search-end")
+    if search_start > search_end:
+        raise SystemExit(f"--search-start {search_start} is after --search-end {search_end}")
+    SEARCH_START_DATE = search_start.isoformat()
+    SEARCH_DATE_CLOSED = search_end.isoformat()
+
+    if args.out:
+        out = Path(args.out)
+        if not out.is_absolute():
+            out = Path(__file__).parent / out
+        if out.suffix.lower() != ".csv":
+            out = out.with_name(out.name + ".csv")
+    else:
+        out = build_default_output_csv(
+            TARGET_COUNTRY, SEARCH_HS_CODE, SEARCH_COMPANY_NAME, search_start, search_end
+        )
+    OUT_CSV = out
+    stem = out.with_suffix("")
+    OUT_META = stem.with_name(stem.name + "_meta.json")
+    OUT_SCREENSHOT = stem.with_name(stem.name + ".png")
+    OUT_DEBUG_HTML = stem.with_name(stem.name + "_debug.html")
+    OUT_DEBUG_SCREENSHOT = stem.with_name(stem.name + "_debug.png")
+
+    if args.start_date:
+        NON_DETAIL_START_FROM_DATE = _parse_iso_date_arg(args.start_date, "--start-date")
+    else:
+        NON_DETAIL_START_FROM_DATE = search_end
     FETCH_DETAIL_PAGES = bool(args.detail)
 
 
@@ -202,6 +283,44 @@ def set_date_input_by_placeholder(page: Page, placeholder: str, value: str) -> N
         value,
     )
     log(f"         → date picker: set {placeholder!r} = {value!r}")
+
+
+def _range_date_input(page: Page, placeholder: str):
+    return page.locator(f"input.el-range-input[placeholder='{placeholder}']").first
+
+
+def set_search_date_range(page: Page, start: str, end: str) -> None:
+    """Fill Start/End Date. Current site: one Element UI range picker with two
+    input.el-range-input (placeholders 'Start Date' / 'End Date'). Older layout: two
+    input.form-control.date-picker (placeholders 'Start Date' / 'Date Closed')."""
+    start_input = _range_date_input(page, "Start Date")
+    end_input = _range_date_input(page, "End Date")
+    if start_input.count() == 0:
+        log("         → range picker not found; using legacy date-picker inputs")
+        set_date_input_by_placeholder(page, "Start Date", start)
+        set_date_input_by_placeholder(page, "Date Closed", end)
+        return
+
+    for label, loc, value in (("Start Date", start_input, start), ("End Date", end_input, end)):
+        log(f"         → range picker: type {label} = {value!r}")
+        loc.wait_for(state="visible", timeout=30000)
+        loc.click()
+        page.wait_for_timeout(400)  # picker panel mounts on focus
+        loc.fill(value)  # fires 'input'
+        loc.dispatch_event("change")  # picker parses typed text on 'change'
+        page.wait_for_timeout(300)
+
+    # Close the picker panel, then check the values stuck.
+    page.keyboard.press("Escape")
+    page.locator("xpath=//label[contains(normalize-space(), 'HS Code')]").first.click()
+    page.wait_for_timeout(500)
+    got_start = start_input.input_value().strip()
+    got_end = end_input.input_value().strip()
+    if (got_start, got_end) != (start, end):
+        raise RuntimeError(
+            f"Date range shows {got_start!r}..{got_end!r}, expected {start!r}..{end!r}"
+        )
+    log(f"         → range picker: confirmed {got_start} .. {got_end}")
 
 
 def choose_import_export_export(page: Page) -> None:
@@ -356,15 +475,36 @@ def click_exporter_transaction_details_tab(page: Page) -> None:
     log("         → Exporter Transaction Details tab clicked.")
 
 
+def set_company_name(page: Page, value: str) -> None:
+    log("         → waiting for Company Name input (≤30s)…")
+    # The company input has placeholder "eg WIKO USA INC. Just enter WIKO".
+    input_locator = page.locator("input[placeholder*='Just enter']").first
+    if input_locator.count() == 0:
+        input_locator = page.locator(
+            "xpath=//label[contains(normalize-space(), 'Company Name')]/following::input[1]"
+        ).first
+    input_locator.wait_for(state="visible", timeout=30000)
+    input_locator.click()
+    input_locator.fill(value)
+    page.keyboard.press("Tab")
+    actual = input_locator.input_value()
+    if actual.strip() != value.strip():
+        raise RuntimeError(f"Company Name input shows {actual!r}, expected {value!r}")
+    log(f"         → Company Name set: {value!r}")
+
+
 def apply_search_filters(page: Page) -> None:
     log("      [3a/7] Set Import/Export to Export")
     choose_import_export_export(page)
     log("      [3b/7] Fill HS Code")
     set_input_value(page, "HS Code", SEARCH_HS_CODE)
-    log("      [3c/7] Fill Start Date")
-    set_date_input_by_placeholder(page, "Start Date", SEARCH_START_DATE)
-    log("      [3d/7] Fill Date Closed")
-    set_date_input_by_placeholder(page, "Date Closed", SEARCH_DATE_CLOSED)
+    if SEARCH_COMPANY_NAME:
+        log("      [3b2/7] Fill Company Name")
+        set_company_name(page, SEARCH_COMPANY_NAME)
+    else:
+        log("      [3b2/7] Company Name: none (no company filter)")
+    log("      [3c/7] Fill Start Date / End Date")
+    set_search_date_range(page, SEARCH_START_DATE, SEARCH_DATE_CLOSED)
     log("      [3e/7] Submit Query")
     click_query_button(page)
     page.wait_for_timeout(2000)
@@ -852,9 +992,12 @@ def main() -> None:
     args = parse_cli_args()
     apply_runtime_config(args)
     log(
-        f"[config] country={TARGET_COUNTRY} "
+        f"[config] country={TARGET_COUNTRY} hs_code={SEARCH_HS_CODE} "
+        f"company={SEARCH_COMPANY_NAME or '(none)'} "
+        f"search={SEARCH_START_DATE}..{SEARCH_DATE_CLOSED} "
         f"start_date={NON_DETAIL_START_FROM_DATE.isoformat()} detail={FETCH_DETAIL_PAGES}"
     )
+    log(f"[config] output CSV: {OUT_CSV}")
     log("[1/4] Reading cookie header...")
     cookie_header = get_cookie_header(REQUEST_HEADER_FILE)
     cookies = parse_cookie_header(cookie_header, TARGET_URL)
