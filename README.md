@@ -15,7 +15,16 @@ playwright install chromium
 
 Copy `request_header_sample.txt` to `request_header.txt`. Then log in to https://data.nbd.ltd with your own account, open the browser's developer tools (F12 → Network), reload the Transaction Search page and copy the `Cookie:` value of the page request into the file. Only the `Cookie:` line is required.
 
-This step is optional. Without a cookie, or when the cookie has expired, the site shows its login page in the browser window the script opens. Log in there by hand (account, password, captcha); the script waits up to 15 minutes (`LOGIN_WAIT_SEC`), then continues. It also writes the new cookies into the `Cookie:` line of `request_header.txt`, so the next run starts logged in.
+This step is optional. Without a cookie, or when the cookie has expired, the site shows its login page in the browser window the script opens. The script then waits up to 15 minutes (`LOGIN_WAIT_SEC`) for you to log in, and continues afterwards. It also writes the new cookies into the `Cookie:` line of `request_header.txt`, so the next run starts logged in.
+
+To have the account and password filled in for you, create a `.env` file next to the script:
+
+```
+NBD_USERNAME=your_username_or_email
+NBD_PASSWORD=your_password
+```
+
+The script picks the login type from the account (`Email` if it contains `@`, otherwise `Username`), fills both fields and leaves only the verification code and the LOGIN click to you. Without `.env`, choose Email/Username in the dropdown yourself: logging in with a username while the dropdown says Email fails with "bad credentials". Never commit `.env`.
 
 Never commit or share `request_header.txt`, because it gives access to your account.
 

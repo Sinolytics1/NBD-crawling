@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import time
 from contextlib import suppress
 from datetime import date, datetime
@@ -66,6 +67,8 @@ DETAIL_TIMEOUT_BACKOFF_SEC = 1800
 
 # If the site redirects to the login page, wait this long for a manual login in the browser.
 LOGIN_WAIT_SEC = 900
+# NBD_USERNAME / NBD_PASSWORD for pre-filling the login form (never committed).
+ENV_FILE = Path(__file__).with_name(".env")
 
 # When OUT_CSV exists and is non-empty, main() runs detail enrich only (table scrape is skipped).
 # To run table scrape again, rename/remove OUT_CSV or empty the file first.
@@ -236,15 +239,84 @@ def is_login_page(page: Page) -> bool:
     return "/login" in (urlparse(page.url).path or "")
 
 
+def load_env_file(path: Path) -> dict[str, str]:
+    """Minimal .env reader: KEY=VALUE lines, optional quotes, # comments."""
+    out: dict[str, str] = {}
+    if not path.exists():
+        return out
+    for raw in path.read_text(encoding="utf-8-sig").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :]
+        key, value = line.split("=", 1)
+        key, value = key.strip(), value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        out[key] = value
+    return out
+
+
+def get_login_credentials() -> tuple[str, str]:
+    """NBD_USERNAME / NBD_PASSWORD from the environment, else from .env next to this script."""
+    env = load_env_file(ENV_FILE)
+    user = os.environ.get("NBD_USERNAME") or env.get("NBD_USERNAME", "")
+    password = os.environ.get("NBD_PASSWORD") or env.get("NBD_PASSWORD", "")
+    return user.strip(), password
+
+
+def prefill_login_form(page: Page, user: str, password: str) -> None:
+    """Pick Email/Username login type, fill account and password, focus the captcha box.
+    The captcha and the LOGIN click are left to the user."""
+    login_type = "Email" if "@" in user else "Username"
+    toggle = page.locator("button.dropdown-toggle").first
+    toggle.wait_for(state="visible", timeout=30000)
+    if toggle.inner_text().strip() != login_type:
+        toggle.click()
+        page.locator(".dropdown-menu a").filter(has_text=login_type).first.click()
+        page.wait_for_timeout(300)
+    if toggle.inner_text().strip() != login_type:
+        raise RuntimeError(f"could not switch login type to {login_type}")
+    account = page.locator(
+        "input.form-control[type='text']:not([placeholder*='erification'])"
+    ).first
+    account.fill(user)
+    page.locator("input.form-control[type='password']").first.fill(password)
+    page.locator("input[placeholder*='erification']").first.click()
+    log(f"      Login type '{login_type}' selected; account and password filled from .env.")
+
+
 def wait_for_manual_login(page: Page) -> bool:
     """If the page is the login page, wait until the user logs in in the browser window.
-    Returns True if a login happened, False if already logged in."""
+    Account/password are pre-filled from .env when available. Returns True if a login
+    happened, False if already logged in."""
     if not is_login_page(page):
         return False
+    # Drop expired cookies so the login (and its captcha) starts from a fresh session.
+    page.context.clear_cookies()
+    page.reload(wait_until="domcontentloaded", timeout=60000)
+    page.wait_for_timeout(2000)
+
+    user, password = get_login_credentials()
+    prefilled = False
+    if user and password:
+        try:
+            prefill_login_form(page, user, password)
+            prefilled = True
+        except Exception as exc:
+            log(f"      [warn] Could not pre-fill the login form ({type(exc).__name__}: {exc}).")
+    else:
+        log(f"      No NBD_USERNAME / NBD_PASSWORD in {ENV_FILE.name}; log in by hand.")
+
     log("")
     log("=" * 70)
     log("  Not logged in (cookie missing or expired).")
-    log("  Log in in the browser window: account, password, captcha.")
+    if prefilled:
+        log("  In the browser window: type the verification code, then click LOGIN.")
+    else:
+        log("  In the browser window: pick Email/Username, enter account, password,")
+        log("  verification code, then click LOGIN.")
     log(f"  Waiting up to {LOGIN_WAIT_SEC // 60} minutes; the scrape continues after login.")
     log("=" * 70)
     deadline = time.time() + LOGIN_WAIT_SEC
