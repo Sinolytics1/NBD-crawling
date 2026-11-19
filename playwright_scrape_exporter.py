@@ -64,6 +64,9 @@ CSV_ANCHOR_DATE = date(2025, 12, 30)
 # After this many consecutive detail-page timeouts, pause (seconds).
 DETAIL_TIMEOUT_BACKOFF_SEC = 1800
 
+# If the site redirects to the login page, wait this long for a manual login in the browser.
+LOGIN_WAIT_SEC = 900
+
 # When OUT_CSV exists and is non-empty, main() runs detail enrich only (table scrape is skipped).
 # To run table scrape again, rename/remove OUT_CSV or empty the file first.
 DETAIL_DATA_DIR = Path(__file__).with_name("detailed data")
@@ -218,11 +221,78 @@ def save_page_debug_snapshot(page: Page) -> None:
 
 
 def get_cookie_header(file_path: Path) -> str:
+    """Cookie value from request_header.txt, or "" if the file or line is missing
+    (the run then starts logged out and waits for a manual login)."""
+    if not file_path.exists():
+        return ""
     for raw_line in file_path.read_text(encoding="utf-8").splitlines():
         line = raw_line.strip()
         if line.lower().startswith("cookie:"):
             return line.split(":", 1)[1].strip()
-    raise ValueError("Cookie header not found in request_header.txt")
+    return ""
+
+
+def is_login_page(page: Page) -> bool:
+    return "/login" in (urlparse(page.url).path or "")
+
+
+def wait_for_manual_login(page: Page) -> bool:
+    """If the page is the login page, wait until the user logs in in the browser window.
+    Returns True if a login happened, False if already logged in."""
+    if not is_login_page(page):
+        return False
+    log("")
+    log("=" * 70)
+    log("  Not logged in (cookie missing or expired).")
+    log("  Log in in the browser window: account, password, captcha.")
+    log(f"  Waiting up to {LOGIN_WAIT_SEC // 60} minutes; the scrape continues after login.")
+    log("=" * 70)
+    deadline = time.time() + LOGIN_WAIT_SEC
+    while is_login_page(page):
+        if time.time() > deadline:
+            raise RuntimeError(f"No login within {LOGIN_WAIT_SEC // 60} minutes; stopping.")
+        page.wait_for_timeout(2000)
+    log(f"      Login detected (now at {page.url!r}).")
+    page.wait_for_timeout(2000)
+    return True
+
+
+def save_cookies_to_header_file(context, file_path: Path) -> int:
+    """Write the browser's current NBD cookies into the Cookie: line of request_header.txt,
+    so the next run starts logged in. Other lines in the file are kept."""
+    cookies = [c for c in context.cookies() if (c.get("domain") or "").lstrip(".").endswith("nbd.ltd")]
+    if not cookies:
+        return 0
+    cookie_line = "Cookie: " + "; ".join(f"{c['name']}={c['value']}" for c in cookies)
+    lines = file_path.read_text(encoding="utf-8").splitlines() if file_path.exists() else []
+    out_lines: list[str] = []
+    replaced = False
+    for line in lines:
+        if line.strip().lower().startswith("cookie:"):
+            if not replaced:
+                out_lines.append(cookie_line)
+                replaced = True
+            continue
+        out_lines.append(line)
+    if not replaced:
+        out_lines.append(cookie_line)
+    file_path.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
+    return len(cookies)
+
+
+def open_search_page_logged_in(page: Page, context) -> None:
+    """Open TARGET_URL; if redirected to the login page, wait for a manual login,
+    save the new cookies to request_header.txt and reopen TARGET_URL."""
+    page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=60000)
+    page.wait_for_timeout(2000)
+    if wait_for_manual_login(page):
+        n = save_cookies_to_header_file(context, REQUEST_HEADER_FILE)
+        log(f"      Saved {n} cookies to {REQUEST_HEADER_FILE.name} for the next run.")
+        page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=60000)
+        page.wait_for_timeout(2000)
+        if is_login_page(page):
+            raise RuntimeError("Still on the login page after logging in; stopping.")
+    log(f"      Opened page: url={page.url!r} title={page.title()!r}")
 
 
 def parse_cookie_header(cookie_header: str, target_url: str) -> list[dict]:
@@ -1000,19 +1070,26 @@ def main() -> None:
     log(f"[config] output CSV: {OUT_CSV}")
     log("[1/4] Reading cookie header...")
     cookie_header = get_cookie_header(REQUEST_HEADER_FILE)
-    cookies = parse_cookie_header(cookie_header, TARGET_URL)
-    log(f"      Parsed cookies: {len(cookies)}")
+    cookies = parse_cookie_header(cookie_header, TARGET_URL) if cookie_header else []
+    if cookies:
+        log(f"      Parsed cookies: {len(cookies)}")
+    else:
+        log(f"      No cookie in {REQUEST_HEADER_FILE.name}; you will be asked to log in.")
 
     csv_nonempty = OUT_CSV.exists() and bool(OUT_CSV.read_text(encoding="utf-8-sig").strip())
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=False)
         context = browser.new_context()
-        context.add_cookies(cookies)
+        if cookies:
+            context.add_cookies(cookies)
 
         if FETCH_DETAIL_PAGES and csv_nonempty:
             log("[2/4] Launching browser (detail enrich: existing CSV, skip table scrape)")
             try:
+                login_page = context.new_page()
+                open_search_page_logged_in(login_page, context)
+                login_page.close()
                 fixed, _full_header, detail_meta = enrich_csv_details_date_range(context)
                 OUT_META.write_text(
                     json.dumps(detail_meta, ensure_ascii=False, indent=2),
@@ -1026,9 +1103,7 @@ def main() -> None:
             log("[2/4] Launching browser (table scrape, no detail pages)...")
             page = context.new_page()
             try:
-                page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=60000)
-                page.wait_for_timeout(2000)
-                log(f"      Opened page: url={page.url!r} title={page.title()!r}")
+                open_search_page_logged_in(page, context)
 
                 log(f"[3/4] Filters → Query → {TARGET_COUNTRY} → Exporter Transaction Details…")
                 apply_search_filters(page)

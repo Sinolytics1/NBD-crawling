@@ -15,7 +15,9 @@ playwright install chromium
 
 Copy `request_header_sample.txt` to `request_header.txt`. Then log in to https://data.nbd.ltd with your own account, open the browser's developer tools (F12 → Network), reload the Transaction Search page and copy the `Cookie:` value of the page request into the file. Only the `Cookie:` line is required.
 
-The cookie expires after a while. If the script lands on a login page, copy a fresh one. Never commit or share `request_header.txt`, because it gives access to your account.
+This step is optional. Without a cookie, or when the cookie has expired, the site shows its login page in the browser window the script opens. Log in there by hand (account, password, captcha); the script waits up to 15 minutes (`LOGIN_WAIT_SEC`), then continues. It also writes the new cookies into the `Cookie:` line of `request_header.txt`, so the next run starts logged in.
+
+Never commit or share `request_header.txt`, because it gives access to your account.
 
 **3. Run**
 
