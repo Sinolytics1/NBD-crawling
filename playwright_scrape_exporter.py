@@ -4,6 +4,7 @@ import argparse
 import csv
 import json
 import os
+import re
 import time
 from contextlib import suppress
 from datetime import date, datetime
@@ -25,18 +26,19 @@ except ImportError:
 
 REQUEST_HEADER_FILE = Path(__file__).with_name("request_header.txt")
 TARGET_URL = "https://data.nbd.ltd/en/transaction/search?fl=1"
-TARGET_COUNTRY = "CHINA"  # Optional: "CHINA" or "VIETNAM"
-COUNTRY_CHOICES = {"CHINA", "VIETNAM"}
+# Country button clicked after Query (any country listed on the result page, any continent).
+TARGET_COUNTRY = "CHINA"
+TRADE_TYPE_CHOICES = ["Import", "Export"]
+RESULT_TAB_CHOICES = ["importer", "exporter"]
+# Languages in the "multilingual" popover next to Product Keywords.
+KEYWORD_LANG_CHOICES = ["English", "Russia", "Spanish", "Portugal", "French", "Ukrainian"]
 
-if TARGET_COUNTRY not in COUNTRY_CHOICES:
-    raise ValueError(f"TARGET_COUNTRY must be one of {sorted(COUNTRY_CHOICES)}, got {TARGET_COUNTRY!r}")
-
-_country_slug = TARGET_COUNTRY.strip().lower()
-OUT_CSV = Path(__file__).with_name(f"{_country_slug}_exporter_transaction.csv")
-OUT_META = Path(__file__).with_name(f"{_country_slug}_exporter_transaction_meta.json")
-OUT_SCREENSHOT = Path(__file__).with_name(f"{_country_slug}_exporter_transaction.png")
-OUT_DEBUG_HTML = Path(__file__).with_name(f"{_country_slug}_exporter_transaction_debug.html")
-OUT_DEBUG_SCREENSHOT = Path(__file__).with_name(f"{_country_slug}_exporter_transaction_debug.png")
+# Output paths; all of them are set in apply_runtime_config() from the CLI arguments.
+OUT_CSV = Path(__file__).with_name("nbd_transaction.csv")
+OUT_META = Path(__file__).with_name("nbd_transaction_meta.json")
+OUT_SCREENSHOT = Path(__file__).with_name("nbd_transaction.png")
+OUT_DEBUG_HTML = Path(__file__).with_name("nbd_transaction_debug.html")
+OUT_DEBUG_SCREENSHOT = Path(__file__).with_name("nbd_transaction_debug.png")
 DETAIL_EXTRA_COLUMNS = [
     "Description Of Goods",
     "USD Amount(FOB)",
@@ -48,12 +50,21 @@ DETAIL_EXTRA_COLUMNS = [
 # and enrich_csv_details_date_range() when CSV exists (main()).
 FETCH_DETAIL_PAGES = False
 
-# Search form (transaction search page). Defaults; override with --hs-code / --company /
-# --search-start / --search-end.
-SEARCH_HS_CODE = "850710"
+# Search form (transaction search page). Defaults; every one has a CLI argument.
+SEARCH_TRADE_TYPE = "Export"  # "Import" or "Export"
+SEARCH_HS_CODE = ""  # empty = no HS filter
+SEARCH_KEYWORDS = ""  # Product Keywords; empty = no keyword filter
+SEARCH_KEYWORD_LANGS: list[str] = []  # subset of KEYWORD_LANG_CHOICES to tick
 SEARCH_COMPANY_NAME = ""  # empty = do not filter by company
-SEARCH_START_DATE = "2025-01-01"
-SEARCH_DATE_CLOSED = "2025-12-31"
+# Result tab: "importer" / "exporter" Transaction Details. None = follow SEARCH_TRADE_TYPE.
+RESULT_TAB: str | None = None
+# Default date range = the page's own default: the last year up to today.
+_TODAY = date.today()
+SEARCH_DATE_CLOSED = _TODAY.isoformat()
+try:
+    SEARCH_START_DATE = _TODAY.replace(year=_TODAY.year - 1).isoformat()
+except ValueError:  # 29 Feb
+    SEARCH_START_DATE = _TODAY.replace(year=_TODAY.year - 1, day=28).isoformat()
 ROWS_PER_PAGE_ASSUMED = 10  # used with existing row count to skip pages when resuming
 # Non-detail scrape starts writing once Date <= this anchor date (while clicking Next).
 # Set to None to write from page 1.
@@ -72,8 +83,11 @@ ENV_FILE = Path(__file__).with_name(".env")
 
 # When OUT_CSV exists and is non-empty, main() runs detail enrich only (table scrape is skipped).
 # To run table scrape again, rename/remove OUT_CSV or empty the file first.
+# Detail batches go to <output CSV name>_details/ by default (--detail-dir), one folder per
+# search, so different searches never overwrite each other's batch files.
 DETAIL_DATA_DIR = Path(__file__).with_name("detailed data")
 DETAIL_BATCH_ROWS = 200
+# Detail pass date range; defaults to the search range (--detail-start / --detail-end).
 DETAIL_RANGE_START = date(2025, 1, 1)
 DETAIL_RANGE_END = date(2025, 12, 31)
 
@@ -91,59 +105,160 @@ def parse_bool_arg(value: str) -> bool:
     raise argparse.ArgumentTypeError(f"Invalid boolean value: {value!r}; use TRUE/FALSE")
 
 
+def _parse_choice(value: str, choices: list[str], name: str) -> str:
+    v = (value or "").strip().lower()
+    for c in choices:
+        if c.lower() == v:
+            return c
+    raise argparse.ArgumentTypeError(f"{name} must be one of {choices}, got {value!r}")
+
+
+def _parse_keyword_langs(value: str) -> list[str]:
+    """Comma list like "russian,ukrainian" -> ["Russia", "Ukrainian"] (matched on first 4 letters)."""
+    out: list[str] = []
+    for part in (value or "").split(","):
+        p = part.strip().lower()
+        if not p:
+            continue
+        match = [c for c in KEYWORD_LANG_CHOICES if c.lower()[:4] == p[:4]]
+        if not match:
+            raise argparse.ArgumentTypeError(
+                f"unknown keyword language {part.strip()!r}; choose from {KEYWORD_LANG_CHOICES}"
+            )
+        if match[0] not in out:
+            out.append(match[0])
+    return out
+
+
 def parse_cli_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Scrape NBD exporter transaction table (optionally detail enrich)."
+        description="Scrape the NBD transaction search table (optionally enrich from detail pages)."
     )
-    parser.add_argument(
-        "--country",
-        default=TARGET_COUNTRY,
-        type=str.upper,
-        choices=sorted(COUNTRY_CHOICES),
-        help="Country button to click (CHINA or VIETNAM).",
+    g = parser.add_argument_group("search form")
+    g.add_argument(
+        "--trade-type",
+        default=SEARCH_TRADE_TYPE,
+        type=lambda v: _parse_choice(v, TRADE_TYPE_CHOICES, "--trade-type"),
+        help=f"'Import or Export' dropdown: import or export (default: {SEARCH_TRADE_TYPE.lower()}).",
     )
-    parser.add_argument(
-        "--hs-code",
-        default=SEARCH_HS_CODE,
-        help=f"HS code to search (default: {SEARCH_HS_CODE}).",
+    g.add_argument("--hs-code", default=SEARCH_HS_CODE, help="HS Code (default: none).")
+    g.add_argument(
+        "--keywords",
+        default=SEARCH_KEYWORDS,
+        help='Product Keywords, in English, e.g. "thermal paper" (default: none).',
     )
-    parser.add_argument(
+    g.add_argument(
+        "--keyword-langs",
+        default=",".join(SEARCH_KEYWORD_LANGS),
+        type=_parse_keyword_langs,
+        help=(
+            "Languages to tick in the 'multilingual' popover, comma separated: "
+            f"{', '.join(KEYWORD_LANG_CHOICES)} (default: none)."
+        ),
+    )
+    g.add_argument(
         "--company",
         default=SEARCH_COMPANY_NAME,
-        help='Company Name filter, e.g. "HENAN JIANGHE PAPER CO., LTD." (default: no filter).',
+        help='Company Name, e.g. "HENAN JIANGHE PAPER CO., LTD." (default: none).',
     )
-    parser.add_argument(
+    g.add_argument(
         "--search-start",
         default=SEARCH_START_DATE,
-        help=f"Search form Start Date, YYYY-MM-DD (default: {SEARCH_START_DATE}).",
+        help=f"Start Date, YYYY-MM-DD (default: {SEARCH_START_DATE}).",
     )
-    parser.add_argument(
+    g.add_argument(
         "--search-end",
         default=SEARCH_DATE_CLOSED,
-        help=f"Search form End Date, YYYY-MM-DD (default: {SEARCH_DATE_CLOSED}).",
+        help=f"End Date, YYYY-MM-DD (default: {SEARCH_DATE_CLOSED}).",
     )
-    parser.add_argument(
+
+    g = parser.add_argument_group("result page")
+    g.add_argument(
+        "--country",
+        default=TARGET_COUNTRY,
+        type=lambda v: v.strip().upper(),
+        help=(
+            "Country button to click after Query, as shown on the page, e.g. CHINA, VIETNAM, "
+            f"UNITED KINGDOM; any continent tab (default: {TARGET_COUNTRY})."
+        ),
+    )
+    g.add_argument(
+        "--tab",
+        default=None,
+        type=lambda v: _parse_choice(v, RESULT_TAB_CHOICES, "--tab"),
+        help=(
+            "Result tab: importer or exporter (Transaction Details). "
+            "Default: importer for --trade-type import, exporter for export."
+        ),
+    )
+    g.add_argument(
         "--start-date",
         default=None,
         help=(
-            "Start collecting non-detail rows when Date <= this value (YYYY-MM-DD). "
-            "Default: same as --search-end, i.e. collect everything in the search range."
+            "Start saving table rows once Date <= this value (YYYY-MM-DD). "
+            "Default: --search-end, i.e. save everything in the search range."
         ),
     )
-    parser.add_argument(
+
+    g = parser.add_argument_group("output")
+    g.add_argument(
         "--out",
         default=None,
         help=(
             "Output CSV file name or path (relative paths are next to this script). "
-            "Default: built from country, HS code, company and search dates, e.g. "
-            "china_48119000_HENAN_JIANGHE_PAPER_CO_LTD_20251119-20261119.csv"
+            "Default: built from the search, e.g. "
+            "china_export_48119000_HENAN_JIANGHE_PAPER_CO_LTD_20251119-20261119.csv"
         ),
     )
-    parser.add_argument(
+
+    g = parser.add_argument_group("detail mode")
+    g.add_argument(
         "--detail",
         default=False,
         type=parse_bool_arg,
-        help="TRUE: run detail enrich mode when CSV exists. FALSE: non-detail table scrape mode.",
+        help=(
+            "TRUE: also fetch detail pages. If the CSV for this search does not exist yet, "
+            "the table is scraped first; if it exists, only details are fetched. "
+            "FALSE: scrape the result table only (default)."
+        ),
+    )
+    g.add_argument(
+        "--detail-start",
+        default=None,
+        help="Only fetch details for rows with Date >= this (YYYY-MM-DD). Default: --search-start.",
+    )
+    g.add_argument(
+        "--detail-end",
+        default=None,
+        help="Only fetch details for rows with Date <= this (YYYY-MM-DD). Default: --search-end.",
+    )
+    g.add_argument(
+        "--detail-batch-rows",
+        default=DETAIL_BATCH_ROWS,
+        type=int,
+        help=f"Write a batch CSV every N rows (default: {DETAIL_BATCH_ROWS}).",
+    )
+    g.add_argument(
+        "--detail-dir",
+        default=None,
+        help="Folder for batch CSVs. Default: <output CSV name>_details next to the CSV.",
+    )
+    g.add_argument(
+        "--detail-pause-min",
+        default=DETAIL_TIMEOUT_BACKOFF_SEC // 60,
+        type=int,
+        help=(
+            "Minutes to pause after 3 detail-page timeouts in a row "
+            f"(default: {DETAIL_TIMEOUT_BACKOFF_SEC // 60})."
+        ),
+    )
+
+    g = parser.add_argument_group("login")
+    g.add_argument(
+        "--login-wait-min",
+        default=LOGIN_WAIT_SEC // 60,
+        type=int,
+        help=f"Minutes to wait for a manual login (default: {LOGIN_WAIT_SEC // 60}).",
     )
     return parser.parse_args()
 
@@ -155,31 +270,71 @@ def _parse_iso_date_arg(value: str, name: str) -> date:
         raise SystemExit(f"{name} must be YYYY-MM-DD, got {value!r}")
 
 
-def _company_slug(company: str, max_len: int = 40) -> str:
+def _slug(text: str, max_len: int = 40) -> str:
     out = []
-    for ch in company.upper():
+    for ch in text.upper():
         out.append(ch if ch.isascii() and ch.isalnum() else "_")
     slug = "_".join(part for part in "".join(out).split("_") if part)
     return slug[:max_len].rstrip("_")
 
 
-def build_default_output_csv(country: str, hs_code: str, company: str, start: date, end: date) -> Path:
-    parts = [country.strip().lower(), hs_code.strip() or "allhs"]
-    slug = _company_slug(company)
-    if slug:
-        parts.append(slug)
+def default_result_tab(trade_type: str) -> str:
+    return "importer" if trade_type == "Import" else "exporter"
+
+
+def build_default_output_csv(
+    country: str,
+    trade_type: str,
+    hs_code: str,
+    keywords: str,
+    keyword_langs: list[str],
+    company: str,
+    tab: str,
+    start: date,
+    end: date,
+) -> Path:
+    """<country>_<import|export>[_<hs>][_KW_<keywords>[_<langs>]][_<company>][_<tab>tab]_<start>-<end>.csv"""
+    parts = [_slug(country).lower() or "all", trade_type.lower()]
+    if hs_code.strip():
+        parts.append(hs_code.strip())
+    kw = _slug(keywords, 30)
+    if kw:
+        parts.append(f"KW_{kw}")
+        if keyword_langs:
+            parts.append("-".join(lang[:3].upper() for lang in keyword_langs))
+    company_slug = _slug(company)
+    if company_slug:
+        parts.append(company_slug)
+    if tab != default_result_tab(trade_type):
+        parts.append(f"{tab}tab")
     parts.append(f"{start:%Y%m%d}-{end:%Y%m%d}")
     return Path(__file__).with_name("_".join(parts) + ".csv")
 
 
+def _resolve_path(value: str) -> Path:
+    p = Path(value)
+    return p if p.is_absolute() else Path(__file__).parent / p
+
+
 def apply_runtime_config(args: argparse.Namespace) -> None:
-    global TARGET_COUNTRY, SEARCH_HS_CODE, SEARCH_COMPANY_NAME, SEARCH_START_DATE, SEARCH_DATE_CLOSED
+    global TARGET_COUNTRY, SEARCH_TRADE_TYPE, SEARCH_HS_CODE, SEARCH_KEYWORDS, SEARCH_KEYWORD_LANGS
+    global SEARCH_COMPANY_NAME, SEARCH_START_DATE, SEARCH_DATE_CLOSED, RESULT_TAB
     global OUT_CSV, OUT_META, OUT_SCREENSHOT, OUT_DEBUG_HTML, OUT_DEBUG_SCREENSHOT
     global NON_DETAIL_START_FROM_DATE, FETCH_DETAIL_PAGES
+    global DETAIL_DATA_DIR, DETAIL_RANGE_START, DETAIL_RANGE_END, DETAIL_BATCH_ROWS
+    global DETAIL_TIMEOUT_BACKOFF_SEC, LOGIN_WAIT_SEC
 
     TARGET_COUNTRY = args.country
+    SEARCH_TRADE_TYPE = args.trade_type
     SEARCH_HS_CODE = (args.hs_code or "").strip()
+    SEARCH_KEYWORDS = (args.keywords or "").strip()
+    SEARCH_KEYWORD_LANGS = list(args.keyword_langs)
     SEARCH_COMPANY_NAME = (args.company or "").strip()
+    RESULT_TAB = args.tab or default_result_tab(SEARCH_TRADE_TYPE)
+    if not (SEARCH_HS_CODE or SEARCH_KEYWORDS or SEARCH_COMPANY_NAME):
+        raise SystemExit("Give at least one of --hs-code, --keywords, --company.")
+    if SEARCH_KEYWORD_LANGS and not SEARCH_KEYWORDS:
+        raise SystemExit("--keyword-langs needs --keywords.")
 
     search_start = _parse_iso_date_arg(args.search_start, "--search-start")
     search_end = _parse_iso_date_arg(args.search_end, "--search-end")
@@ -189,14 +344,20 @@ def apply_runtime_config(args: argparse.Namespace) -> None:
     SEARCH_DATE_CLOSED = search_end.isoformat()
 
     if args.out:
-        out = Path(args.out)
-        if not out.is_absolute():
-            out = Path(__file__).parent / out
+        out = _resolve_path(args.out)
         if out.suffix.lower() != ".csv":
             out = out.with_name(out.name + ".csv")
     else:
         out = build_default_output_csv(
-            TARGET_COUNTRY, SEARCH_HS_CODE, SEARCH_COMPANY_NAME, search_start, search_end
+            TARGET_COUNTRY,
+            SEARCH_TRADE_TYPE,
+            SEARCH_HS_CODE,
+            SEARCH_KEYWORDS,
+            SEARCH_KEYWORD_LANGS,
+            SEARCH_COMPANY_NAME,
+            RESULT_TAB,
+            search_start,
+            search_end,
         )
     OUT_CSV = out
     stem = out.with_suffix("")
@@ -204,6 +365,23 @@ def apply_runtime_config(args: argparse.Namespace) -> None:
     OUT_SCREENSHOT = stem.with_name(stem.name + ".png")
     OUT_DEBUG_HTML = stem.with_name(stem.name + "_debug.html")
     OUT_DEBUG_SCREENSHOT = stem.with_name(stem.name + "_debug.png")
+
+    DETAIL_DATA_DIR = (
+        _resolve_path(args.detail_dir) if args.detail_dir else stem.with_name(stem.name + "_details")
+    )
+    DETAIL_RANGE_START = (
+        _parse_iso_date_arg(args.detail_start, "--detail-start") if args.detail_start else search_start
+    )
+    DETAIL_RANGE_END = (
+        _parse_iso_date_arg(args.detail_end, "--detail-end") if args.detail_end else search_end
+    )
+    if DETAIL_RANGE_START > DETAIL_RANGE_END:
+        raise SystemExit(f"detail range {DETAIL_RANGE_START} is after {DETAIL_RANGE_END}")
+    if args.detail_batch_rows < 1:
+        raise SystemExit("--detail-batch-rows must be >= 1")
+    DETAIL_BATCH_ROWS = args.detail_batch_rows
+    DETAIL_TIMEOUT_BACKOFF_SEC = max(0, args.detail_pause_min) * 60
+    LOGIN_WAIT_SEC = max(1, args.login_wait_min) * 60
 
     if args.start_date:
         NON_DETAIL_START_FROM_DATE = _parse_iso_date_arg(args.start_date, "--start-date")
@@ -465,20 +643,68 @@ def set_search_date_range(page: Page, start: str, end: str) -> None:
     log(f"         → range picker: confirmed {got_start} .. {got_end}")
 
 
-def choose_import_export_export(page: Page) -> None:
+def choose_trade_type(page: Page, trade_type: str) -> None:
+    """Pick 'Import' or 'Export' in the 'Import or Export' dropdown and verify it."""
     log("         → waiting for Import/Export control (≤30s)…")
     select_input = page.locator(
         "xpath=//label[contains(normalize-space(), 'Import or Export')]/following::input[contains(@class, 'el-input__inner')][1]"
     ).first
     select_input.wait_for(state="visible", timeout=30000)
     select_input.click()
-    log("         → waiting for Export option in dropdown…")
+    log(f"         → waiting for {trade_type} option in dropdown…")
     option = page.locator(
-        "xpath=//div[contains(@class, 'el-select-dropdown')]//li[normalize-space()='Export']"
+        f"xpath=//div[contains(@class, 'el-select-dropdown')]//li[normalize-space()='{trade_type}']"
     ).first
     option.wait_for(state="visible", timeout=30000)
     option.click()
-    log("         → Export selected.")
+    page.wait_for_timeout(300)
+    actual = select_input.input_value().strip()
+    if actual != trade_type:
+        raise RuntimeError(f"Import or Export shows {actual!r}, expected {trade_type!r}")
+    log(f"         → {trade_type} selected.")
+
+
+def set_product_keywords(page: Page, value: str) -> None:
+    log("         → waiting for Product Keywords input (≤30s)…")
+    input_locator = page.locator("input[placeholder*='English keyword']").first
+    if input_locator.count() == 0:
+        input_locator = page.locator(
+            "xpath=//label[contains(normalize-space(), 'Product Keywords')]/following::input[1]"
+        ).first
+    input_locator.wait_for(state="visible", timeout=30000)
+    input_locator.click()
+    input_locator.fill(value)
+    page.keyboard.press("Tab")
+    actual = input_locator.input_value()
+    if actual.strip() != value.strip():
+        raise RuntimeError(f"Product Keywords input shows {actual!r}, expected {value!r}")
+    log(f"         → Product Keywords set: {value!r}")
+
+
+def set_keyword_languages(page: Page, langs: list[str]) -> None:
+    """Tick exactly `langs` in the 'multilingual' popover (checkboxes English, Russia, ...)."""
+    ref = page.locator("xpath=//*[@aria-describedby][contains(normalize-space(), 'multilingual')]").first
+    ref.wait_for(state="attached", timeout=30000)
+    pop_id = ref.get_attribute("aria-describedby")
+    toggle_js = """([id, wanted]) => {
+        const labels = [...document.getElementById(id).querySelectorAll('label.el-checkbox')];
+        for (const l of labels) {
+            const want = wanted.includes(l.innerText.trim());
+            const checked = l.querySelector('input').checked;
+            if (want !== checked) l.querySelector('input').click();
+        }
+    }"""
+    page.evaluate(toggle_js, [pop_id, langs])
+    page.wait_for_timeout(400)
+    state = page.evaluate(
+        """id => [...document.getElementById(id).querySelectorAll('label.el-checkbox')]
+            .map(l => [l.innerText.trim(), l.querySelector('input').checked])""",
+        pop_id,
+    )
+    ticked = sorted(name for name, checked in state if checked)
+    if ticked != sorted(langs):
+        raise RuntimeError(f"multilingual shows {ticked}, expected {sorted(langs)}")
+    log(f"         → Keyword languages ticked: {', '.join(ticked)}")
 
 
 def wait_table_loaded(page: Page, *, step: str | None = None) -> None:
@@ -576,45 +802,52 @@ def click_query_button(page: Page) -> None:
     log("         → Query clicked.")
 
 
+COUNTRY_BUTTONS = "[id^='continent_'] button"
+
+
 def click_country_button(page: Page, country: str) -> None:
-    # Match pane like <div id="continent_1" class="tab-pane show active">…<button>VIETNAM (…)</button>
-    # Do not require div.tab-content — that ancestor is often absent, which made the old chain never match.
+    """Click the country button (e.g. 'CHINA (46)') in whichever continent tab holds it.
+    Panes look like <div id="continent_2" class="tab-pane">…<button>UNITED KINGDOM (3077)</button>,
+    with tab links Asia / Europe / North America / … pointing at #continent_N."""
     target_country = (country or "").strip().upper()
     if not target_country:
         raise ValueError("country must be non-empty")
-    log(
-        f"         → waiting for {target_country} button "
-        f"(#continent_1.tab-pane button, has_text {target_country}, ≤120s)…"
-    )
-    btn = (
-        page.locator("#continent_1.tab-pane button")
-        .filter(has_text=target_country)
-        .first
-    )
+    log(f"         → looking for {target_country} button in all continent tabs (≤120s)…")
+    page.locator(COUNTRY_BUTTONS).first.wait_for(state="attached", timeout=120000)
+    # Exact name before the count, so CHINA does not match e.g. "TAIWAN, CHINA (5)".
+    pattern = re.compile(rf"^\s*{re.escape(target_country)}\s*\(", re.IGNORECASE)
+    btn = page.locator(COUNTRY_BUTTONS).filter(has_text=pattern).first
     if btn.count() == 0:
-        # Fallback for pages where active class/DOM nesting differs.
-        btn = page.locator("#continent_1 button").filter(has_text=target_country).first
-    btn.wait_for(state="visible", timeout=120000)
-    log(f"         → {target_country} button visible, clicking…")
+        available = [t.strip() for t in page.locator(COUNTRY_BUTTONS).all_inner_texts() if t.strip()]
+        raise RuntimeError(
+            f"No {target_country!r} button in the results. Available: {', '.join(available[:60])}"
+        )
+    if not btn.is_visible():
+        pane_id = btn.evaluate("b => b.closest(\"[id^='continent_']\").id")
+        tab_link = page.locator(
+            f"[href='#{pane_id}'], [data-target='#{pane_id}'], [aria-controls='{pane_id}']"
+        ).first
+        log(f"         → {target_country} is under '{tab_link.inner_text().strip()}', opening that tab…")
+        tab_link.click()
+        page.wait_for_timeout(600)
+    btn.wait_for(state="visible", timeout=30000)
+    log(f"         → {btn.inner_text().strip()} button visible, clicking…")
     btn.click()
     log(f"         → {target_country} clicked.")
 
 
-def click_vietnam_country_button(page: Page) -> None:
-    # Keep backward-compatible helper.
-    click_country_button(page, "VIETNAM")
-
-
-def click_exporter_transaction_details_tab(page: Page) -> None:
-    log("         → waiting for 'Exporter Transaction Details' tab (≤30s)…")
+def click_transaction_details_tab(page: Page, which: str) -> None:
+    """which: 'importer' or 'exporter' -> '<Importer|Exporter> Transaction Details' tab."""
+    label = f"{which.capitalize()} Transaction Details"
+    log(f"         → waiting for '{label}' tab (≤30s)…")
     tab = page.locator(
         "xpath=(//*[contains(@class,'el-tabs__item') or contains(@class,'nav-link')]"
-        "[contains(., 'Exporter Transaction Details')])[1]"
+        f"[contains(., '{label}')])[1]"
     ).first
     tab.wait_for(state="visible", timeout=30000)
     log("         → tab visible, clicking…")
     tab.click()
-    log("         → Exporter Transaction Details tab clicked.")
+    log(f"         → {label} tab clicked.")
 
 
 def set_company_name(page: Page, value: str) -> None:
@@ -636,39 +869,50 @@ def set_company_name(page: Page, value: str) -> None:
 
 
 def apply_search_filters(page: Page) -> None:
-    log("      [3a/7] Set Import/Export to Export")
-    choose_import_export_export(page)
-    log("      [3b/7] Fill HS Code")
-    set_input_value(page, "HS Code", SEARCH_HS_CODE)
+    log(f"      [3a/7] Set Import or Export to {SEARCH_TRADE_TYPE}")
+    choose_trade_type(page, SEARCH_TRADE_TYPE)
+    if SEARCH_HS_CODE:
+        log("      [3b/7] Fill HS Code")
+        set_input_value(page, "HS Code", SEARCH_HS_CODE)
+    else:
+        log("      [3b/7] HS Code: none")
+    if SEARCH_KEYWORDS:
+        log("      [3c/7] Fill Product Keywords")
+        set_product_keywords(page, SEARCH_KEYWORDS)
+        if SEARCH_KEYWORD_LANGS:
+            set_keyword_languages(page, SEARCH_KEYWORD_LANGS)
+    else:
+        log("      [3c/7] Product Keywords: none")
     if SEARCH_COMPANY_NAME:
-        log("      [3b2/7] Fill Company Name")
+        log("      [3d/7] Fill Company Name")
         set_company_name(page, SEARCH_COMPANY_NAME)
     else:
-        log("      [3b2/7] Company Name: none (no company filter)")
-    log("      [3c/7] Fill Start Date / End Date")
+        log("      [3d/7] Company Name: none")
+    log("      [3e/7] Fill Start Date / End Date")
     set_search_date_range(page, SEARCH_START_DATE, SEARCH_DATE_CLOSED)
-    log("      [3e/7] Submit Query")
+    log("      [3f/7] Submit Query")
     click_query_button(page)
     page.wait_for_timeout(2000)
     wait_table_loaded(page, step="after Query")
-    # Strong check: country panel should become interactable after Query.
-    country_probe = page.locator("#continent_1 button").first
-    country_probe.wait_for(state="visible", timeout=60000)
-    log("         → Query effect confirmed: country buttons are visible.")
+    # Strong check: country buttons appear (in some continent tab) after Query.
+    page.locator(COUNTRY_BUTTONS).first.wait_for(state="attached", timeout=60000)
+    log("         → Query effect confirmed: country buttons are present.")
 
 
-def load_csv_table_resume_state() -> tuple[set[tuple[str, ...]], list[str], list[list[str]]]:
-    """Load existing table CSV for dedup + resume; strips trailing detail columns if present."""
+def load_csv_table_resume_state() -> tuple[set[tuple[str, ...]], list[str], list[list[str]], list[str]]:
+    """Load existing CSV for dedup + resume.
+    Returns (seen table-column keys, table header, full rows, trailing detail header).
+    Rows keep their detail columns, so a table rerun never drops already fetched details."""
     if not OUT_CSV.exists():
-        return set(), [], []
+        return set(), [], [], []
     text = OUT_CSV.read_text(encoding="utf-8-sig")
     if not text.strip():
-        return set(), [], []
+        return set(), [], [], []
 
     with OUT_CSV.open("r", encoding="utf-8-sig", newline="") as f:
         rows = list(csv.reader(f))
     if not rows:
-        return set(), [], []
+        return set(), [], [], []
 
     header = [h.strip() for h in rows[0]]
     data_rows = [list(r) for r in rows[1:] if any((c or "").strip() for c in r)]
@@ -683,19 +927,17 @@ def load_csv_table_resume_state() -> tuple[set[tuple[str, ...]], list[str], list
         base_len = len(header)
         table_header = list(header)
 
+    extra_header = header[base_len:]
     seen: set[tuple[str, ...]] = set()
-    norm_rows: list[list[str]] = []
+    full_rows: list[list[str]] = []
     for r in data_rows:
-        padded = r + [""] * max(0, len(header) - len(r))
-        row_base = list(padded[:base_len])
-        while len(row_base) < base_len:
-            row_base.append("")
-        base_tuple = tuple(row_base)
+        padded = _pad_row_to_len(r, len(header))[: len(header)]
+        base_tuple = tuple(padded[:base_len])
         if any(c.strip() for c in base_tuple):
             seen.add(base_tuple)
-        norm_rows.append(row_base)
+        full_rows.append(padded)
 
-    return seen, table_header, norm_rows
+    return seen, table_header, full_rows, extra_header
 
 
 # --- Detail page helpers (used by enrich_csv_missing_details / optional detail mode) ---
@@ -886,6 +1128,14 @@ def write_csv_all(header: list[str], data_rows: list[list[str]]) -> None:
         w.writerows(data_rows)
 
 
+def _next_detail_batch_index() -> int:
+    existing = []
+    for p in DETAIL_DATA_DIR.glob("detail_batch_*.csv"):
+        with suppress(ValueError):
+            existing.append(int(p.stem.rsplit("_", 1)[1]))
+    return max(existing, default=0) + 1
+
+
 def _flush_detail_batch_csv(batch_index: int, header: list[str], rows: list[list[str]]) -> Path:
     DETAIL_DATA_DIR.mkdir(parents=True, exist_ok=True)
     path = DETAIL_DATA_DIR / f"detail_batch_{batch_index:04d}.csv"
@@ -970,11 +1220,12 @@ def enrich_csv_details_date_range(context) -> tuple[int, list[str], dict]:
 
     consecutive_timeouts = 0
     fixed = 0
-    batch_index = 1
+    # Continue numbering after existing batch files so a rerun never overwrites earlier batches.
+    batch_index = _next_detail_batch_index()
     chunk_buffer: list[list[str]] = []
 
     iter_rows = (
-        tqdm(to_process, desc="Detail fetch (2025 range)", unit="row", dynamic_ncols=True)
+        tqdm(to_process, desc="Detail fetch", unit="row", dynamic_ncols=True)
         if tqdm
         else to_process
     )
@@ -1130,16 +1381,126 @@ def enrich_csv_missing_details(context) -> tuple[int, list[str], int | None]:
     return fixed, full_header, anchor_idx
 
 
+def scrape_table(page: Page, context) -> dict:
+    """Search form -> Query -> country -> Transaction Details tab -> page through the table,
+    appending new rows to OUT_CSV. Keeps detail columns of rows already in the CSV."""
+    tab_label = f"{RESULT_TAB.capitalize()} Transaction Details"
+    log(f"[3/4] Filters → Query → {TARGET_COUNTRY} → {tab_label}…")
+    apply_search_filters(page)
+    log(f"      [3g/7] Click {TARGET_COUNTRY} country")
+    click_country_button(page, TARGET_COUNTRY)
+    wait_table_loaded(page, step=f"after {TARGET_COUNTRY} click")
+    log(f"      [3h/7] Switch to {tab_label} tab")
+    click_transaction_details_tab(page, RESULT_TAB)
+    wait_table_loaded(page, step=f"after {tab_label} tab")
+
+    log("      [3/4] UI steps finished; reading CSV resume state…")
+    seen, table_header, all_rows, extra_header = load_csv_table_resume_state()
+    skip_pages = max(0, len(all_rows) // ROWS_PER_PAGE_ASSUMED - 1)
+    log(f"      Resume: existing_rows={len(all_rows)}, skip_pages={skip_pages}")
+    for i in range(skip_pages):
+        if not click_next_if_possible(page):
+            log(f"      skip: stopped early at {i + 1}/{skip_pages}")
+            break
+
+    log("[4/4] Paginated table scrape…")
+    page_idx = 0
+    new_rows = 0
+    started_collecting = NON_DETAIL_START_FROM_DATE is None
+    while True:
+        page_idx += 1
+        wait_table_loaded(page)
+        headers, rows = read_active_table(page)
+        if not table_header:
+            if not headers:
+                log(f"      Page {page_idx}: no table header; stopping.")
+                break
+            table_header = list(headers)
+            log(f"      Table columns: {len(table_header)}")
+        elif headers and headers != table_header:
+            log(
+                f"      [warn] Page {page_idx}: thead differs from CSV header; "
+                "padding/truncating rows."
+            )
+
+        if not started_collecting:
+            started_collecting = _page_reached_non_detail_start_date(
+                rows,
+                table_header,
+                NON_DETAIL_START_FROM_DATE,
+            )
+            if started_collecting and NON_DETAIL_START_FROM_DATE is not None:
+                log(
+                    f"      Reached anchor Date<={NON_DETAIL_START_FROM_DATE.isoformat()} "
+                    f"at page {page_idx}; start collecting from this page."
+                )
+
+        if started_collecting:
+            ncols = len(table_header)
+            for row in rows:
+                padded = _pad_row_to_len(row, ncols)[:ncols]
+                key = tuple(padded)
+                if not any((c or "").strip() for c in key):
+                    continue
+                if key in seen:
+                    continue
+                seen.add(key)
+                all_rows.append(padded + [""] * len(extra_header))
+                new_rows += 1
+        else:
+            log(
+                f"      Page {page_idx}: anchor Date<={NON_DETAIL_START_FROM_DATE.isoformat()} "
+                "not reached; continue clicking Next."
+            )
+
+        write_csv_all(table_header + extra_header, all_rows)
+        log(
+            f"      Page {page_idx}: rows_on_page={len(rows)}, "
+            f"new_this_run={new_rows}, total_rows={len(all_rows)}"
+        )
+
+        if not click_next_if_possible(page):
+            break
+
+    with suppress(Exception):
+        page.screenshot(path=str(OUT_SCREENSHOT), full_page=True)
+
+    return {
+        "mode": "table_scrape",
+        "pages_visited": page_idx,
+        "rows_total": len(all_rows),
+        "new_rows_this_run": new_rows,
+        "skip_pages_applied": skip_pages,
+        "headers": table_header + extra_header,
+        "output_csv": str(OUT_CSV),
+    }
+
+
 def main() -> None:
     args = parse_cli_args()
     apply_runtime_config(args)
     log(
-        f"[config] country={TARGET_COUNTRY} hs_code={SEARCH_HS_CODE} "
-        f"company={SEARCH_COMPANY_NAME or '(none)'} "
-        f"search={SEARCH_START_DATE}..{SEARCH_DATE_CLOSED} "
+        f"[config] trade_type={SEARCH_TRADE_TYPE} hs_code={SEARCH_HS_CODE or '(none)'} "
+        f"keywords={SEARCH_KEYWORDS or '(none)'}"
+        + (f" [{', '.join(SEARCH_KEYWORD_LANGS)}]" if SEARCH_KEYWORD_LANGS else "")
+        + f" company={SEARCH_COMPANY_NAME or '(none)'} "
+        f"search={SEARCH_START_DATE}..{SEARCH_DATE_CLOSED}"
+    )
+    log(
+        f"[config] country={TARGET_COUNTRY} tab={RESULT_TAB} "
         f"start_date={NON_DETAIL_START_FROM_DATE.isoformat()} detail={FETCH_DETAIL_PAGES}"
     )
+    if FETCH_DETAIL_PAGES:
+        log(
+            f"[config] detail range={DETAIL_RANGE_START}..{DETAIL_RANGE_END} "
+            f"batch_rows={DETAIL_BATCH_ROWS} dir={DETAIL_DATA_DIR}"
+        )
     log(f"[config] output CSV: {OUT_CSV}")
+
+    csv_nonempty = OUT_CSV.exists() and bool(OUT_CSV.read_text(encoding="utf-8-sig").strip())
+    # --detail TRUE on an existing CSV only enriches it; otherwise scrape the table first.
+    run_table = not (FETCH_DETAIL_PAGES and csv_nonempty)
+
     log("[1/4] Reading cookie header...")
     cookie_header = get_cookie_header(REQUEST_HEADER_FILE)
     cookies = parse_cookie_header(cookie_header, TARGET_URL) if cookie_header else []
@@ -1148,134 +1509,38 @@ def main() -> None:
     else:
         log(f"      No cookie in {REQUEST_HEADER_FILE.name}; you will be asked to log in.")
 
-    csv_nonempty = OUT_CSV.exists() and bool(OUT_CSV.read_text(encoding="utf-8-sig").strip())
-
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=False)
         context = browser.new_context()
         if cookies:
             context.add_cookies(cookies)
+        page = context.new_page()
+        meta: dict = {}
+        try:
+            if run_table:
+                log("[2/4] Launching browser (table scrape)...")
+            else:
+                log("[2/4] Launching browser (CSV exists: detail enrich only, table scrape skipped)")
+            open_search_page_logged_in(page, context)
 
-        if FETCH_DETAIL_PAGES and csv_nonempty:
-            log("[2/4] Launching browser (detail enrich: existing CSV, skip table scrape)")
-            try:
-                login_page = context.new_page()
-                open_search_page_logged_in(login_page, context)
-                login_page.close()
-                fixed, _full_header, detail_meta = enrich_csv_details_date_range(context)
-                OUT_META.write_text(
-                    json.dumps(detail_meta, ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
-                log(f"[3/4] Detail enrich finished; rows updated this run: {fixed}")
-            finally:
-                context.close()
-                browser.close()
-        else:
-            log("[2/4] Launching browser (table scrape, no detail pages)...")
-            page = context.new_page()
-            try:
-                open_search_page_logged_in(page, context)
-
-                log(f"[3/4] Filters → Query → {TARGET_COUNTRY} → Exporter Transaction Details…")
-                apply_search_filters(page)
-                log(f"      [3f/7] Click {TARGET_COUNTRY} country")
-                click_country_button(page, TARGET_COUNTRY)
-                wait_table_loaded(page, step=f"after {TARGET_COUNTRY} click")
-                log("      [3g/7] Switch to Exporter Transaction Details tab")
-                click_exporter_transaction_details_tab(page)
-                wait_table_loaded(page, step="after Exporter Transaction Details tab")
-
-                log("      [3/4] UI steps finished; reading CSV resume state…")
-                seen, table_header, all_rows = load_csv_table_resume_state()
-                skip_pages = max(0, len(all_rows) // ROWS_PER_PAGE_ASSUMED - 1)
-                log(f"      Resume: existing_rows={len(all_rows)}, skip_pages={skip_pages}")
-                for i in range(skip_pages):
-                    if not click_next_if_possible(page):
-                        log(f"      skip: stopped early at {i + 1}/{skip_pages}")
-                        break
-
-                log("[4/4] Paginated table scrape…")
-                page_idx = 0
-                new_rows = 0
-                started_collecting = NON_DETAIL_START_FROM_DATE is None
-                while True:
-                    page_idx += 1
-                    wait_table_loaded(page)
-                    headers, rows = read_active_table(page)
-                    if not table_header:
-                        if not headers:
-                            log(f"      Page {page_idx}: no table header; stopping.")
-                            break
-                        table_header = list(headers)
-                        log(f"      Table columns: {len(table_header)}")
-                    elif headers and headers != table_header:
-                        log(
-                            f"      [warn] Page {page_idx}: thead differs from CSV header; "
-                            "padding/truncating rows."
-                        )
-
-                    if not started_collecting:
-                        started_collecting = _page_reached_non_detail_start_date(
-                            rows,
-                            table_header,
-                            NON_DETAIL_START_FROM_DATE,
-                        )
-                        if started_collecting and NON_DETAIL_START_FROM_DATE is not None:
-                            log(
-                                f"      Reached anchor Date<={NON_DETAIL_START_FROM_DATE.isoformat()} "
-                                f"at page {page_idx}; start collecting from this page."
-                            )
-
-                    if started_collecting:
-                        ncols = len(table_header)
-                        for row in rows:
-                            padded = _pad_row_to_len(row, ncols)
-                            if len(padded) > ncols:
-                                padded = padded[:ncols]
-                            key = tuple(padded)
-                            if not any((c or "").strip() for c in key):
-                                continue
-                            if key in seen:
-                                continue
-                            seen.add(key)
-                            all_rows.append(padded)
-                            new_rows += 1
-                    else:
-                        log(
-                            f"      Page {page_idx}: anchor Date<={NON_DETAIL_START_FROM_DATE.isoformat()} "
-                            "not reached; continue clicking Next."
-                        )
-
-                    write_csv_all(table_header, all_rows)
-                    log(
-                        f"      Page {page_idx}: rows_on_page={len(rows)}, "
-                        f"new_this_run={new_rows}, total_rows={len(all_rows)}"
-                    )
-
-                    if not click_next_if_possible(page):
-                        break
-
-                with suppress(Exception):
-                    page.screenshot(path=str(OUT_SCREENSHOT), full_page=True)
-
-                meta = {
-                    "mode": "table_scrape",
-                    "pages_visited": page_idx,
-                    "rows_total": len(all_rows),
-                    "new_rows_this_run": new_rows,
-                    "skip_pages_applied": skip_pages,
-                    "headers": table_header,
-                    "output_csv": str(OUT_CSV),
-                }
+            if run_table:
+                try:
+                    meta = scrape_table(page, context)
+                except Exception:
+                    log("      Saving debug snapshot from current browser session…")
+                    save_page_debug_snapshot(page)
+                    raise
                 OUT_META.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
-            except Exception:
-                log("      Saving debug snapshot from current browser session…")
-                save_page_debug_snapshot(page)
-                raise
-            finally:
-                context.close()
-                browser.close()
+
+            if FETCH_DETAIL_PAGES:
+                log("[detail] Fetching detail pages…")
+                fixed, _full_header, detail_meta = enrich_csv_details_date_range(context)
+                meta = {"table_scrape": meta, "detail_enrich": detail_meta} if run_table else detail_meta
+                OUT_META.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+                log(f"[detail] Detail enrich finished; rows updated this run: {fixed}")
+        finally:
+            context.close()
+            browser.close()
 
     log("Done.")
     log(f"Saved CSV: {OUT_CSV}")
